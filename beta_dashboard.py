@@ -266,26 +266,42 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner="Fetching data...")
 def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
     """
     Fetch stock and market data using yfinance
     Returns Close prices for both tickers
     """
     try:
+        # Add headers to avoid being blocked by Yahoo Finance on cloud servers
+        import yfinance as yf
+        from datetime import datetime
+        
+        # Set up session with proper headers
+        session = yf.Session()
+        session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        
+        # Convert start_date to datetime if it's a string
+        if isinstance(start_date, str):
+            start_date = datetime.strptime(start_date, '%Y-%m-%d')
+        
         # Download separately to avoid yfinance issues with multiple tickers
         stock_data = yf.download(
             stock_ticker,
             start=start_date,
             auto_adjust=False,
-            progress=False
+            progress=False,
+            session=session,
+            timeout=10
         )
         
         market_data = yf.download(
             market_ticker,
             start=start_date,
             auto_adjust=False,
-            progress=False
+            progress=False,
+            session=session,
+            timeout=10
         )
         
         if stock_data.empty:
