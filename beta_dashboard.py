@@ -274,30 +274,42 @@ def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
         from datetime import datetime
         import time
         import requests
+        import requests_cache
         
         # Convert start_date to datetime if it's a string
         if isinstance(start_date, str):
             start_date = datetime.strptime(start_date, '%Y-%m-%d')
         
-        # Set up session with headers to avoid being blocked
-        session = requests.Session()
+        # Set up cached session to reduce requests and avoid rate limiting
+        session = requests_cache.CachedSession('yfinance.cache', expire_after=3600)
         session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0'
         })
         
         # Retry logic for cloud environments
-        max_retries = 3
+        max_retries = 5
         stock_data = None
         market_data = None
         
         for attempt in range(max_retries):
             try:
-                # Use Ticker objects with session - alternative approach
+                # Add random delay to avoid rate limiting
+                if attempt > 0:
+                    delay = 2 + (attempt * 0.5)
+                    st.warning(f"Attempt {attempt + 1} failed, retrying in {delay}s...")
+                    time.sleep(delay)
+                
+                # Use Ticker objects with session
                 stock = yf.Ticker(stock_ticker, session=session)
                 market = yf.Ticker(market_ticker, session=session)
                 
@@ -311,7 +323,7 @@ def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
                     keepna=False,
                     proxy=None,
                     rounding=False,
-                    timeout=30
+                    timeout=60
                 )
                 
                 market_data = market.history(
@@ -323,17 +335,12 @@ def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
                     keepna=False,
                     proxy=None,
                     rounding=False,
-                    timeout=30
+                    timeout=60
                 )
                 
                 # If successful, break
                 if not stock_data.empty and not market_data.empty:
                     break
-                    
-                # Wait before retry
-                if attempt < max_retries - 1:
-                    st.warning(f"Attempt {attempt + 1} failed, retrying...")
-                    time.sleep(2)
                     
             except Exception as e:
                 if attempt < max_retries - 1:
