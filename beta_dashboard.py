@@ -895,6 +895,12 @@ def main():
     # Color picker
     chart_color = st.sidebar.color_picker("Chart Color", value="#0083B8")
     
+    # Cache clearing
+    if st.sidebar.button("🔄 Clear Cache", help="Clear cached data to fetch fresh data"):
+        st.cache_data.clear()
+        st.success("Cache cleared! Try fetching data again.")
+        st.rerun()
+    
     # Calculate button
     if st.sidebar.button("Calculate Beta", type="primary"):
         if start_date >= end_date:
