@@ -273,32 +273,28 @@ def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
     Returns Close prices for both tickers
     """
     try:
-        # Add headers to avoid being blocked by Yahoo Finance on cloud servers
-        import requests
         from datetime import datetime
-        
-        # Set up session with proper headers for Yahoo Finance
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        })
         
         # Convert start_date to datetime if it's a string
         if isinstance(start_date, str):
             start_date = datetime.strptime(start_date, '%Y-%m-%d')
         
-        # Create Ticker objects with session
-        stock = yf.Ticker(stock_ticker, session=session)
-        market = yf.Ticker(market_ticker, session=session)
+        # Download with simple approach - yfinance handles sessions internally
+        stock_data = yf.download(
+            stock_ticker,
+            start=start_date,
+            progress=False,
+            show_errors=False,
+            timeout=30
+        )
         
-        # Download data using the Ticker objects
-        stock_data = stock.history(start=start_date, auto_adjust=False)
-        market_data = market.history(start=start_date, auto_adjust=False)
+        market_data = yf.download(
+            market_ticker,
+            start=start_date,
+            progress=False,
+            show_errors=False,
+            timeout=30
+        )
         
         if stock_data.empty:
             st.warning(f"No data returned for {stock_ticker}")
@@ -748,7 +744,8 @@ def load_nifty_750_stocks():
 
 
 def main():
-    st.title("📈 Beta Analysis Dashboard")
+    # Main title with markdown to ensure it displays
+    st.markdown("# 📈 Beta Analysis Dashboard")
     st.caption("Calculate and visualize stock beta using CAPM or Rolling Beta methods")
     
     # Sidebar inputs
