@@ -108,9 +108,7 @@ st.markdown("""
         font-size: 2.5rem !important;
         font-weight: 700 !important;
         margin-bottom: 0.5rem !important;
-        background: linear-gradient(135deg, var(--vscode-lavender), var(--vscode-cyan));
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
+        color: var(--vscode-lavender) !important;
         border-bottom: 3px solid var(--vscode-lavender);
         padding-bottom: 0.5rem;
     }
@@ -274,27 +272,45 @@ def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
     """
     try:
         from datetime import datetime
+        import time
         
         # Convert start_date to datetime if it's a string
         if isinstance(start_date, str):
             start_date = datetime.strptime(start_date, '%Y-%m-%d')
         
-        # Download with simple approach - yfinance handles sessions internally
-        stock_data = yf.download(
-            stock_ticker,
-            start=start_date,
-            progress=False,
-            show_errors=False,
-            timeout=30
-        )
-        
-        market_data = yf.download(
-            market_ticker,
-            start=start_date,
-            progress=False,
-            show_errors=False,
-            timeout=30
-        )
+        # Retry logic for cloud environments
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Download with retries
+                stock_data = yf.download(
+                    stock_ticker,
+                    start=start_date,
+                    progress=False,
+                    show_errors=False
+                )
+                
+                market_data = yf.download(
+                    market_ticker,
+                    start=start_date,
+                    progress=False,
+                    show_errors=False
+                )
+                
+                # If successful, break
+                if not stock_data.empty and not market_data.empty:
+                    break
+                    
+                # Wait before retry
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                else:
+                    raise e
         
         if stock_data.empty:
             st.warning(f"No data returned for {stock_ticker}")
