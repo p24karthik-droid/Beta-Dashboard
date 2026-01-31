@@ -735,10 +735,217 @@ def load_nifty_750_stocks():
         }
 
 
+def run_sector_analysis():
+    """Sector-wise beta analysis"""
+    st.header("📊 Sector Analysis")
+    st.markdown("Analyze average beta and risk across different sectors")
+    
+    # Load NSE stocks
+    try:
+        df = pd.read_csv("Nifty 750.csv")
+    except:
+        st.error("Could not load Nifty 750.csv file")
+        return
+    
+    # Sidebar settings for sector analysis
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Sector Analysis Settings")
+    
+    market_ticker = st.sidebar.selectbox(
+        "Market Index",
+        ["^NSEI", "^BSESN"],
+        format_func=lambda x: "NSE Nifty 50" if x == "^NSEI" else "BSE Sensex"
+    )
+    
+    start_date = st.sidebar.date_input(
+        "Start Date",
+        value=datetime.now() - timedelta(days=365*2),
+        max_value=datetime.now()
+    )
+    
+    end_date = st.sidebar.date_input(
+        "End Date",
+        value=datetime.now(),
+        max_value=datetime.now()
+    )
+    
+    min_stocks = st.sidebar.slider(
+        "Min stocks per sector",
+        min_value=1,
+        max_value=10,
+        value=3,
+        help="Only show sectors with at least this many stocks"
+    )
+    
+    if st.sidebar.button("🔍 Analyze Sectors", type="primary"):
+        with st.spinner("Calculating sector betas..."):
+            # Calculate beta for each stock
+            sector_betas = {}
+            progress_bar = st.progress(0)
+            
+            for idx, row in df.iterrows():
+                progress_bar.progress((idx + 1) / len(df))
+                
+                ticker = row['Symbol'] + '.NS'
+                sector = row['Industry']
+                
+                try:
+                    # Fetch data
+                    stock_prices, market_prices = fetch_data(ticker, market_ticker, start_date.strftime('%Y-%m-%d'), 'Daily')
+                    
+                    if stock_prices is not None and len(stock_prices) > 30:
+                        # Calculate returns
+                        stock_returns = calculate_returns(stock_prices)
+                        market_returns = calculate_returns(market_prices)
+                        
+                        # Calculate beta
+                        result = calculate_capm_beta(stock_returns, market_returns, with_alpha=False)
+                        
+                        if sector not in sector_betas:
+                            sector_betas[sector] = []
+                        sector_betas[sector].append({
+                            'company': row['Company Name'],
+                            'symbol': ticker,
+                            'beta': result['beta']
+                        })
+                except:
+                    continue
+            
+            progress_bar.empty()
+            
+            # Calculate sector statistics
+            sector_stats = []
+            for sector, stocks in sector_betas.items():
+                if len(stocks) >= min_stocks:
+                    betas = [s['beta'] for s in stocks]
+                    sector_stats.append({
+                        'Sector': sector,
+                        'Avg Beta': np.mean(betas),
+                        'Median Beta': np.median(betas),
+                        'Std Dev': np.std(betas),
+                        'Min Beta': np.min(betas),
+                        'Max Beta': np.max(betas),
+                        'Stock Count': len(stocks)
+                    })
+            
+            sector_df = pd.DataFrame(sector_stats).sort_values('Avg Beta', ascending=False)
+            
+            if len(sector_df) == 0:
+                st.warning("No sector data available. Try reducing minimum stocks per sector.")
+                return
+            
+            # Display results
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.subheader("📊 Sector Beta Heatmap")
+                
+                # Create heatmap
+                fig = go.Figure(data=go.Bar(
+                    x=sector_df['Sector'],
+                    y=sector_df['Avg Beta'],
+                    marker=dict(
+                        color=sector_df['Avg Beta'],
+                        colorscale='RdYlGn_r',  # Red (high) to Green (low)
+                        showscale=True,
+                        colorbar=dict(title="Beta")
+                    ),
+                    text=sector_df['Avg Beta'].round(3),
+                    textposition='outside',
+                    hovertemplate='<b>%{x}</b><br>Avg Beta: %{y:.3f}<br>Stocks: %{customdata}<extra></extra>',
+                    customdata=sector_df['Stock Count']
+                ))
+                
+                fig.update_layout(
+                    title="Average Beta by Sector",
+                    xaxis_title="Sector",
+                    yaxis_title="Average Beta",
+                    xaxis_tickangle=-45,
+                    height=500,
+                    template="plotly_dark",
+                    plot_bgcolor='#1e1e1e',
+                    paper_bgcolor='#1e1e1e',
+                    font=dict(color='#d4d4d4')
+                )
+                
+                # Add horizontal line at beta = 1
+                fig.add_hline(y=1.0, line_dash="dash", line_color="#c792ea", 
+                             annotation_text="Market Beta = 1.0", annotation_position="right")
+                
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                st.subheader("🏆 Top Risk Sectors")
+                top_risk = sector_df.nlargest(5, 'Avg Beta')[['Sector', 'Avg Beta', 'Stock Count']]
+                st.dataframe(top_risk, hide_index=True, use_container_width=True)
+                
+                st.subheader("🛡️ Low Risk Sectors")
+                low_risk = sector_df.nsmallest(5, 'Avg Beta')[['Sector', 'Avg Beta', 'Stock Count']]
+                st.dataframe(low_risk, hide_index=True, use_container_width=True)
+            
+            # Full sector statistics table
+            st.subheader("📋 Detailed Sector Statistics")
+            st.dataframe(
+                sector_df.style.background_gradient(subset=['Avg Beta'], cmap='RdYlGn_r'),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Sector distribution chart
+            st.subheader("📈 Sector Beta Distribution")
+            
+            fig2 = go.Figure()
+            
+            for sector in sector_df['Sector'].head(10):  # Top 10 sectors
+                sector_stocks = sector_betas[sector]
+                betas = [s['beta'] for s in sector_stocks]
+                
+                fig2.add_trace(go.Box(
+                    y=betas,
+                    name=sector[:20],  # Truncate long names
+                    boxmean='sd'
+                ))
+            
+            fig2.update_layout(
+                title="Beta Distribution Across Top 10 Sectors",
+                yaxis_title="Beta",
+                xaxis_tickangle=-45,
+                height=500,
+                template="plotly_dark",
+                plot_bgcolor='#1e1e1e',
+                paper_bgcolor='#1e1e1e',
+                font=dict(color='#d4d4d4'),
+                showlegend=False
+            )
+            
+            st.plotly_chart(fig2, use_container_width=True)
+            
+            # Download button
+            csv = sector_df.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Sector Analysis",
+                data=csv,
+                file_name=f"sector_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+
+
 def main():
     st.title("Beta Analysis Dashboard")
     st.caption("Calculate and visualize stock beta using CAPM or Rolling Beta methods")
     
+    # Create tabs for different features
+    tab1, tab2 = st.tabs(["📈 Beta Analysis", "🏭 Sector Analysis"])
+    
+    with tab1:
+        run_beta_analysis()
+    
+    with tab2:
+        run_sector_analysis()
+
+
+def run_beta_analysis():
+    """Main beta analysis feature"""
     # Sidebar inputs
     st.sidebar.header("Input Parameters")
     
