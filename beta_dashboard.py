@@ -108,7 +108,9 @@ st.markdown("""
         font-size: 2.5rem !important;
         font-weight: 700 !important;
         margin-bottom: 0.5rem !important;
-        color: var(--vscode-lavender) !important;
+        background: linear-gradient(135deg, var(--vscode-lavender), var(--vscode-cyan));
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
         border-bottom: 3px solid var(--vscode-lavender);
         padding-bottom: 0.5rem;
     }
@@ -264,81 +266,35 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=3600, show_spinner="Fetching data...")
+@st.cache_data(ttl=3600)
 def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
     """
     Fetch stock and market data using yfinance
     Returns Close prices for both tickers
     """
     try:
-        from datetime import datetime
-        import time
+        # Download separately to avoid yfinance issues with multiple tickers
+        stock_data = yf.download(
+            stock_ticker,
+            start=start_date,
+            auto_adjust=False,
+            progress=False
+        )
         
-        # Convert start_date to datetime if it's a string
-        if isinstance(start_date, str):
-            start_date = datetime.strptime(start_date, '%Y-%m-%d')
+        market_data = yf.download(
+            market_ticker,
+            start=start_date,
+            auto_adjust=False,
+            progress=False
+        )
         
-        # Simplified approach - let yfinance handle everything internally
-        # Sometimes simpler is better for avoiding blocks
-        max_retries = 5
-        stock_data = None
-        market_data = None
-        
-        for attempt in range(max_retries):
-            try:
-                if attempt > 0:
-                    delay = 3 + attempt
-                    st.warning(f"Attempt {attempt + 1}/{max_retries}, waiting {delay}s...")
-                    time.sleep(delay)
-                
-                # Download both tickers together - sometimes more reliable
-                combined = yf.download(
-                    tickers=[stock_ticker, market_ticker],
-                    start=start_date,
-                    progress=False,
-                    group_by='ticker',
-                    threads=False,
-                    ignore_tz=True
-                )
-                
-                if combined.empty:
-                    continue
-                
-                # Extract individual ticker data
-                if len(combined.columns.levels[0]) >= 2:
-                    stock_data = combined[stock_ticker]
-                    market_data = combined[market_ticker]
-                else:
-                    # Fallback to individual downloads
-                    stock_data = yf.download(stock_ticker, start=start_date, progress=False, threads=False)
-                    market_data = yf.download(market_ticker, start=start_date, progress=False, threads=False)
-                
-                # If successful, break
-                if not stock_data.empty and not market_data.empty:
-                    break
-                    
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-                    continue
-                else:
-                    st.error(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}")
-                    raise e
-        
-        if stock_data is None or stock_data.empty:
-            st.error(f"❌ No data returned for {stock_ticker}. This could be due to:")
-            st.error("1. Invalid ticker symbol")
-            st.error("2. No trading data for the selected date range")
-            st.error("3. Yahoo Finance blocking cloud servers")
-            st.info(f"💡 Try: RELIANCE.NS or TCS.NS with dates 2021-2024")
+        if stock_data.empty:
+            st.warning(f"No data returned for {stock_ticker}")
             return None, None
             
-        if market_data is None or market_data.empty:
-            st.error(f"❌ No data returned for {market_ticker}")
+        if market_data.empty:
+            st.warning(f"No data returned for {market_ticker}")
             return None, None
-        
-        # Show debug info
-        st.success(f"✅ Fetched {len(stock_data)} rows for {stock_ticker}")
         
         # Extract Close prices
         stock_prices = stock_data['Close'] if 'Close' in stock_data.columns else stock_data.iloc[:, 0]
@@ -780,8 +736,7 @@ def load_nifty_750_stocks():
 
 
 def main():
-    # Main title with markdown to ensure it displays
-    st.markdown("# 📈 Beta Analysis Dashboard")
+    st.title("Beta Analysis Dashboard")
     st.caption("Calculate and visualize stock beta using CAPM or Rolling Beta methods")
     
     # Sidebar inputs
@@ -876,12 +831,6 @@ def main():
     
     # Color picker
     chart_color = st.sidebar.color_picker("Chart Color", value="#0083B8")
-    
-    # Cache clearing
-    if st.sidebar.button("🔄 Clear Cache", help="Clear cached data to fetch fresh data"):
-        st.cache_data.clear()
-        st.success("Cache cleared! Try fetching data again.")
-        st.rerun()
     
     # Calculate button
     if st.sidebar.button("Calculate Beta", type="primary"):
