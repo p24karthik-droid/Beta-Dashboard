@@ -760,13 +760,17 @@ def run_sector_analysis():
     start_date = st.sidebar.date_input(
         "Start Date",
         value=datetime.now() - timedelta(days=365*2),
-        max_value=datetime.now()
+        min_value=datetime(2000, 1, 1),
+        max_value=datetime.now(),
+        key="sector_start_date"
     )
     
     end_date = st.sidebar.date_input(
         "End Date",
         value=datetime.now(),
-        max_value=datetime.now()
+        min_value=datetime(2000, 1, 1),
+        max_value=datetime.now(),
+        key="sector_end_date"
     )
     
     min_stocks = st.sidebar.slider(
