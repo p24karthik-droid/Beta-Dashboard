@@ -297,13 +297,34 @@ def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
         
         for attempt in range(max_retries):
             try:
-                # Use Ticker objects with session
+                # Use Ticker objects with session - alternative approach
                 stock = yf.Ticker(stock_ticker, session=session)
                 market = yf.Ticker(market_ticker, session=session)
                 
-                # Get history
-                stock_data = stock.history(start=start_date, auto_adjust=False)
-                market_data = market.history(start=start_date, auto_adjust=False)
+                # Get history with explicit parameters
+                stock_data = stock.history(
+                    start=start_date,
+                    auto_adjust=False,
+                    actions=False,
+                    back_adjust=False,
+                    repair=False,
+                    keepna=False,
+                    proxy=None,
+                    rounding=False,
+                    timeout=30
+                )
+                
+                market_data = market.history(
+                    start=start_date,
+                    auto_adjust=False,
+                    actions=False,
+                    back_adjust=False,
+                    repair=False,
+                    keepna=False,
+                    proxy=None,
+                    rounding=False,
+                    timeout=30
+                )
                 
                 # If successful, break
                 if not stock_data.empty and not market_data.empty:
@@ -311,6 +332,7 @@ def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
                     
                 # Wait before retry
                 if attempt < max_retries - 1:
+                    st.warning(f"Attempt {attempt + 1} failed, retrying...")
                     time.sleep(2)
                     
             except Exception as e:
@@ -318,15 +340,23 @@ def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
                     time.sleep(2)
                     continue
                 else:
+                    st.error(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}")
                     raise e
         
-        if stock_data.empty:
-            st.warning(f"No data returned for {stock_ticker}")
+        if stock_data is None or stock_data.empty:
+            st.error(f"❌ No data returned for {stock_ticker}. This could be due to:")
+            st.error("1. Invalid ticker symbol")
+            st.error("2. No trading data for the selected date range")
+            st.error("3. Yahoo Finance blocking cloud servers")
+            st.info(f"💡 Try: RELIANCE.NS or TCS.NS with dates 2021-2024")
             return None, None
             
-        if market_data.empty:
-            st.warning(f"No data returned for {market_ticker}")
+        if market_data is None or market_data.empty:
+            st.error(f"❌ No data returned for {market_ticker}")
             return None, None
+        
+        # Show debug info
+        st.success(f"✅ Fetched {len(stock_data)} rows for {stock_ticker}")
         
         # Extract Close prices
         stock_prices = stock_data['Close'] if 'Close' in stock_data.columns else stock_data.iloc[:, 0]
