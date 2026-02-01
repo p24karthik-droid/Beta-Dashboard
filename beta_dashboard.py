@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 import statsmodels.api as sm
 from sklearn.linear_model import LinearRegression  # Keep for rolling beta
 from io import BytesIO
+import os
 
 # Page config
 st.set_page_config(
@@ -269,10 +270,24 @@ st.markdown("""
 @st.cache_data(ttl=3600)
 def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
     """
-    Fetch stock and market data using yfinance
+    Fetch stock and market data using yfinance with listing date detection
     Returns Close prices for both tickers
     """
     try:
+        # First, try to detect listing date
+        listing_date = None
+        try:
+            stock_info = yf.Ticker(stock_ticker)
+            full_history = stock_info.history(period="max", auto_adjust=False)
+            if not full_history.empty:
+                listing_date = full_history.index[0].date()
+                
+                # If requested start date is before listing, adjust it silently
+                if start_date < listing_date:
+                    start_date = listing_date
+        except:
+            pass  # If we can't detect listing date, proceed with user's date
+        
         # Download separately to avoid yfinance issues with multiple tickers
         stock_data = yf.download(
             stock_ticker,
@@ -305,7 +320,7 @@ def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
         
         if len(stock_prices) == 0 or len(market_prices) == 0:
             st.warning(f"No data after dropna. Stock: {len(stock_prices)}, Market: {len(market_prices)}")
-            return None, None
+            return None, None, None
         
         # Resample if needed
         if frequency == 'Weekly':
@@ -320,13 +335,13 @@ def fetch_data(stock_ticker, market_ticker, start_date, frequency='Daily'):
                 stock_prices = stock_prices.resample('M').last().dropna()
                 market_prices = market_prices.resample('M').last().dropna()
         
-        return stock_prices, market_prices
+        return stock_prices, market_prices, listing_date
         
     except Exception as e:
         st.error(f"Error in fetch_data: {str(e)}")
         import traceback
         st.error(traceback.format_exc())
-        return None, None
+        return None, None, None
 
 
 def calculate_returns(prices):
@@ -446,6 +461,29 @@ def calculate_rolling_beta(stock_returns, market_returns, window):
         dates.append(window_data.index[-1])
     
     return pd.Series(rolling_betas, index=dates)
+
+
+def calculate_sharpe_ratio(returns, risk_free_rate, periods_per_year):
+    """
+    Calculate annualized Sharpe ratio
+    returns: Series of period returns
+    risk_free_rate: Annual risk-free rate (as decimal)
+    periods_per_year: Number of periods in a year (252 for daily, 52 for weekly, 12 for monthly)
+    """
+    # Calculate excess returns
+    rf_period = risk_free_rate / periods_per_year
+    excess_returns = returns - rf_period
+    
+    # Annualize mean and std
+    mean_excess = excess_returns.mean() * periods_per_year
+    std_excess = excess_returns.std() * np.sqrt(periods_per_year)
+    
+    # Sharpe ratio
+    if std_excess == 0:
+        return 0
+    
+    sharpe = mean_excess / std_excess
+    return sharpe
 
 
 def plot_capm(result, color, with_alpha=True):
@@ -988,31 +1026,125 @@ def run_beta_analysis():
     market_display = st.sidebar.selectbox("Market Index", list(market_indices.keys()), index=4)
     market_ticker = market_indices[market_display]
     
-    # Company selection based on index
+    # Initialize session state for additional indices
+    if 'additional_indices' not in st.session_state:
+        st.session_state.additional_indices = []
+    
+    # Display additional index dropdowns with remove buttons
+    for idx, index_name in enumerate(st.session_state.additional_indices):
+        all_selected = [market_display] + [st.session_state.additional_indices[i] for i in range(len(st.session_state.additional_indices)) if i != idx]
+        available_for_this = [index_name] + [ind for ind in market_indices.keys() if ind not in all_selected]
+        
+        col1, col2 = st.sidebar.columns([4, 1])
+        with col1:
+            new_selection = st.selectbox(
+                f"Additional Index {idx + 1}",
+                available_for_this,
+                index=0,
+                key=f"additional_idx_{idx}"
+            )
+            if new_selection != index_name:
+                st.session_state.additional_indices[idx] = new_selection
+                st.rerun()
+        with col2:
+            st.markdown("<br>", unsafe_allow_html=True)  # Align with selectbox
+            if st.button("✖", key=f"remove_idx_{idx}", use_container_width=True):
+                st.session_state.additional_indices.pop(idx)
+                st.rerun()
+    
+    # Add new index button
+    if len(st.session_state.additional_indices) < 2:  # Limit to 2 additional (3 total)
+        all_selected = [market_display] + st.session_state.additional_indices
+        available_indices = [idx for idx in market_indices.keys() if idx not in all_selected]
+        
+        if available_indices:
+            if st.sidebar.button("➕ Add Index", use_container_width=True, key="add_index_btn"):
+                st.session_state.additional_indices.append(available_indices[0])
+                st.rerun()
+    
+    # Company selection based on first index
     if "NSE" in market_display or "BSE" in market_display:
         stock_list = nse_stocks
     else:
         stock_list = us_stocks
     
-    company_display = st.sidebar.selectbox("Company", list(stock_list.keys()))
-    company_ticker = stock_list[company_display]
+    # Ticker selection mode
+    ticker_mode = st.sidebar.radio("Ticker Selection", ["📋 Select from List", "✏️ Enter Manually"], horizontal=True)
     
-    # Date range
+    if ticker_mode == "📋 Select from List":
+        company_display = st.sidebar.selectbox("Company", list(stock_list.keys()), key="company_dropdown")
+        company_ticker = stock_list[company_display]
+    else:
+        company_ticker = st.sidebar.text_input(
+            "Enter Ticker Symbol",
+            value="RELIANCE.NS",
+            help="Enter any valid ticker (e.g., RELIANCE.NS for NSE, AAPL for US)",
+            key="manual_ticker"
+        ).upper().strip()
+    
+    # Date range with preset buttons
+    st.sidebar.markdown("**Date Range**")
+    
+    # Initialize date session state if not exists
+    today = datetime.now().date()
+    if 'date_start' not in st.session_state:
+        st.session_state['date_start'] = today - timedelta(days=365*2)
+    if 'date_end' not in st.session_state:
+        st.session_state['date_end'] = today
+    
+    # Preset buttons - stacked in 2 rows for better fit
+    preset_row1_col1, preset_row1_col2, preset_row1_col3 = st.sidebar.columns(3)
+    preset_row2_col1, preset_row2_col2 = st.sidebar.columns(2)
+    
+    with preset_row1_col1:
+        if st.button("1Y", use_container_width=True, key="preset_1y"):
+            st.session_state['date_start'] = today - timedelta(days=365)
+            st.session_state['date_end'] = today
+            st.rerun()
+    with preset_row1_col2:
+        if st.button("3Y", use_container_width=True, key="preset_3y"):
+            st.session_state['date_start'] = today - timedelta(days=365*3)
+            st.session_state['date_end'] = today
+            st.rerun()
+    with preset_row1_col3:
+        if st.button("5Y", use_container_width=True, key="preset_5y"):
+            st.session_state['date_start'] = today - timedelta(days=365*5)
+            st.session_state['date_end'] = today
+            st.rerun()
+    with preset_row2_col1:
+        if st.button("YTD", use_container_width=True, key="preset_ytd"):
+            st.session_state['date_start'] = datetime(today.year, 1, 1).date()
+            st.session_state['date_end'] = today
+            st.rerun()
+    with preset_row2_col2:
+        if st.button("Max", use_container_width=True, key="preset_max"):
+            st.session_state['date_start'] = datetime(2000, 1, 1).date()
+            st.session_state['date_end'] = today
+            st.rerun()
+    
     col1, col2 = st.sidebar.columns(2)
     with col1:
         start_date = st.date_input(
             "Start Date",
-            value=datetime.now() - timedelta(days=365*2),
-            min_value=datetime(2000, 1, 1),
-            max_value=datetime.now()
+            value=st.session_state['date_start'],
+            min_value=datetime(2000, 1, 1).date(),
+            max_value=datetime.now().date()
         )
+        if start_date != st.session_state['date_start']:
+            st.session_state['date_start'] = start_date
     with col2:
         end_date = st.date_input(
             "End Date",
-            value=datetime.now(),
-            min_value=datetime(2000, 1, 1),
-            max_value=datetime.now()
+            value=st.session_state['date_end'],
+            min_value=datetime(2000, 1, 1).date(),
+            max_value=datetime.now().date()
         )
+        if end_date != st.session_state['date_end']:
+            st.session_state['date_end'] = end_date
+    
+    # Store in session state
+    st.session_state['start_date'] = start_date
+    st.session_state['end_date'] = end_date
     
     # Frequency
     frequency = st.sidebar.selectbox("Data Frequency", ["Daily", "Weekly", "Monthly"], index=0)
@@ -1050,10 +1182,10 @@ def run_beta_analysis():
             st.stop()
         
         with st.spinner("Fetching data and calculating..."):
-            # Fetch data
-            stock_prices, market_prices = fetch_data(company_ticker, market_ticker, start_date, frequency)
+            # Fetch stock data once
+            stock_prices, _, _ = fetch_data(company_ticker, market_ticker, start_date, frequency)
             
-            if stock_prices is None or market_prices is None or len(stock_prices) == 0 or len(market_prices) == 0:
+            if stock_prices is None or len(stock_prices) == 0:
                 st.error(f"Could not fetch data for {company_ticker}")
                 st.info(f"""
                 **Troubleshooting:**
@@ -1063,105 +1195,145 @@ def run_beta_analysis():
                 """)
                 st.stop()
             
+            # Fetch data for primary and additional indices
+            all_selected_indices = [market_display] + st.session_state.get('additional_indices', [])
+            all_index_data = {}
+            listing_date = None
+            for index_name in all_selected_indices:
+                index_ticker = market_indices[index_name]
+                fetched_stock, market_prices, stock_listing = fetch_data(company_ticker, index_ticker, start_date, frequency)
+                if market_prices is not None and len(market_prices) > 0:
+                    if listing_date is None:  # Store listing date from first fetch
+                        stock_prices = fetched_stock
+                        listing_date = stock_listing
+                    all_index_data[index_name] = {
+                        'ticker': index_ticker,
+                        'prices': market_prices
+                    }
+            
+            if not all_index_data:
+                st.error("Could not fetch data for any selected index")
+                st.stop()
+            
             # Calculate returns
             stock_returns = calculate_returns(stock_prices)
-            market_returns = calculate_returns(market_prices)
             
             # Adjust for risk-free rate
             periods_per_year = {"Daily": 252, "Weekly": 52, "Monthly": 12}
             rf_period = risk_free_rate / periods_per_year[frequency]
             
             stock_excess = stock_returns - rf_period
-            market_excess = market_returns - rf_period
             
-            # Store in session state to persist across reruns
+            # Store in session state
             st.session_state['data_calculated'] = True
             st.session_state['stock_prices'] = stock_prices
-            st.session_state['market_prices'] = market_prices
             st.session_state['stock_returns'] = stock_returns
-            st.session_state['market_returns'] = market_returns
             st.session_state['stock_excess'] = stock_excess
-            st.session_state['market_excess'] = market_excess
             st.session_state['company_ticker'] = company_ticker
-            st.session_state['market_ticker'] = market_ticker
             st.session_state['beta_method'] = beta_method
             st.session_state['rolling_period'] = rolling_period
             st.session_state['chart_color'] = chart_color
+            st.session_state['all_index_data'] = all_index_data
+            st.session_state['listing_date'] = listing_date
     
     # Display results if data has been calculated
     if st.session_state.get('data_calculated', False):
         # Retrieve from session state
         stock_prices = st.session_state['stock_prices']
-        market_prices = st.session_state['market_prices']
         stock_returns = st.session_state['stock_returns']
-        market_returns = st.session_state['market_returns']
         stock_excess = st.session_state['stock_excess']
-        market_excess = st.session_state['market_excess']
         company_ticker = st.session_state['company_ticker']
-        market_ticker = st.session_state['market_ticker']
         beta_method = st.session_state['beta_method']
         rolling_period = st.session_state['rolling_period']
         chart_color = st.session_state['chart_color']
+        all_index_data = st.session_state['all_index_data']
+        listing_date = st.session_state.get('listing_date', None)
         
-        # Display data availability info
-        stock_start = stock_prices.index[0].strftime('%Y-%m-%d')
-        stock_end = stock_prices.index[-1].strftime('%Y-%m-%d')
-        market_start = market_prices.index[0].strftime('%Y-%m-%d')
-        market_end = market_prices.index[-1].strftime('%Y-%m-%d')
-        
-        # Convert dates for comparison
-        stock_start_date = stock_prices.index[0].date()
-        market_start_date = market_prices.index[0].date()
-        
-        if stock_start_date > start_date or market_start_date > start_date:
-            st.info(f"""
-            📅 **Data Availability:**
-            - **Requested:** {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}
-            - **{company_ticker}:** {stock_start} to {stock_end}
-            - **{market_ticker}:** {market_start} to {market_end}
+        # If multiple indices, show tabs
+        if len(all_index_data) > 1:
+            tabs = st.tabs([f"📊 {idx_name}" for idx_name in all_index_data.keys()])
             
-            ℹ️ Stock may have been listed after your requested start date.
-            """)
+            for tab, (index_name, index_data) in zip(tabs, all_index_data.items()):
+                with tab:
+                    display_beta_results(
+                        stock_prices, stock_returns, stock_excess,
+                        index_data['prices'], index_data['ticker'], index_name,
+                        company_ticker, beta_method, rolling_period, chart_color,
+                        risk_free_rate, frequency, start_date, end_date, listing_date
+                    )
+        else:
+            # Single index - display directly
+            index_name = list(all_index_data.keys())[0]
+            index_data = all_index_data[index_name]
+            display_beta_results(
+                stock_prices, stock_returns, stock_excess,
+                index_data['prices'], index_data['ticker'], index_name,
+                company_ticker, beta_method, rolling_period, chart_color,
+                risk_free_rate, frequency, start_date, end_date, listing_date
+            )
+
+
+def display_beta_results(stock_prices, stock_returns, stock_excess, market_prices, market_ticker, market_name,
+                        company_ticker, beta_method, rolling_period, chart_color, risk_free_rate, frequency, start_date, end_date, listing_date=None):
+    """
+    Display beta analysis results for a given market index
+    """
+    # Calculate market returns and excess
+    market_returns = calculate_returns(market_prices)
+    periods_per_year_dict = {"Daily": 252, "Weekly": 52, "Monthly": 12}
+    periods_per_year = periods_per_year_dict[frequency]
+    rf_period = risk_free_rate / periods_per_year
+    market_excess = market_returns - rf_period
+    
+    # Calculate Sharpe ratios
+    stock_sharpe = calculate_sharpe_ratio(stock_returns, risk_free_rate, periods_per_year)
+    market_sharpe = calculate_sharpe_ratio(market_returns, risk_free_rate, periods_per_year)
+    
+    # Display info including Sharpe ratios and listing date
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    with col1:
+        st.metric("Stock", company_ticker)
+    with col2:
+        st.metric("Market Index", market_name)
+    with col3:
+        st.metric("Listing Date", listing_date.strftime('%Y-%m-%d') if listing_date else "N/A")
+    with col4:
+        st.metric("Data Points", len(stock_returns))
+    with col5:
+        st.metric("Stock Sharpe", f"{stock_sharpe:.3f}", help="Annualized Sharpe Ratio")
+    with col6:
+        st.metric("Market Sharpe", f"{market_sharpe:.3f}", help="Annualized Sharpe Ratio")
+    
+    # CAPM Beta
+    if beta_method == "CAPM Beta":
+        st.markdown("#### CAPM Beta Analysis")
         
-        # Display info
-        col1, col2, col3 = st.columns(3)
+        result_with = calculate_capm_beta(stock_excess, market_excess, with_alpha=True)
+        result_without = calculate_capm_beta(stock_excess, market_excess, with_alpha=False)
+        
+        if result_with is None or result_without is None:
+            st.error("Failed to calculate beta")
+            st.stop()
+        
+        # Normalized Price Chart (before regression charts)
+        st.markdown("**Normalized Price Performance**")
+        fig_norm = plot_normalized_prices(stock_prices, market_prices, company_ticker, market_ticker)
+        st.plotly_chart(fig_norm, use_container_width=True)
+        
+        # Regression statistics and charts in aligned columns
+        col1, col2 = st.columns(2)
+        
         with col1:
-            st.metric("Stock", company_ticker)
-        with col2:
-            st.metric("Market Index", market_ticker)
-        with col3:
-            st.metric("Data Points", len(stock_returns))
-        
-        # CAPM Beta
-        if beta_method == "CAPM Beta":
-            st.markdown("#### CAPM Beta Analysis")
-            
-            result_with = calculate_capm_beta(stock_excess, market_excess, with_alpha=True)
-            result_without = calculate_capm_beta(stock_excess, market_excess, with_alpha=False)
-            
-            if result_with is None or result_without is None:
-                st.error("Failed to calculate beta")
-                st.stop()
-            
-            # Normalized Price Chart (before regression charts)
-            st.markdown("**Normalized Price Performance**")
-            fig_norm = plot_normalized_prices(stock_prices, market_prices, company_ticker, market_ticker)
-            st.plotly_chart(fig_norm, use_container_width=True)
-            
-            # Regression statistics and charts in aligned columns
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("#### CAPM Regression with Alpha")
-                # Enhanced stats card with 2-column grid layout
-                st.markdown(f"""
-                <div class="stats-card">
-                    <div class="stats-grid">
-                        <div class="stat-row">
-                            <span class="stat-label">Beta</span>
-                            <span class="stat-value">{result_with['beta']:.4f}</span>
-                        </div>
-                        <div class="stat-row">
+            st.markdown("#### CAPM Regression with Alpha")
+            # Enhanced stats card with 2-column grid layout
+            st.markdown(f"""
+            <div class="stats-card">
+                <div class="stats-grid">
+                    <div class="stat-row">
+                        <span class="stat-label">Beta</span>
+                        <span class="stat-value">{result_with['beta']:.4f}</span>
+                    </div>
+                    <div class="stat-row">
                             <span class="stat-label">Alpha</span>
                             <span class="stat-value">{result_with['alpha']:.6f}</span>
                         </div>
@@ -1189,19 +1361,19 @@ def run_beta_analysis():
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # Interactive Plotly chart (no title)
-                fig1_plotly = plot_capm_plotly(result_with, with_alpha=True)
-                st.plotly_chart(fig1_plotly, use_container_width=True)
-            
-            with col2:
-                st.markdown("#### CAPM Regression without Alpha")
-                # Enhanced stats card with 2-column grid layout
-                st.markdown(f"""
-                <div class="stats-card">
-                    <div class="stats-grid">
-                        <div class="stat-row">
-                            <span class="stat-label">Beta</span>
-                            <span class="stat-value">{result_without['beta']:.4f}</span>
+            # Interactive Plotly chart (no title)
+            fig1_plotly = plot_capm_plotly(result_with, with_alpha=True)
+            st.plotly_chart(fig1_plotly, use_container_width=True)
+        
+        with col2:
+            st.markdown("#### CAPM Regression without Alpha")
+            # Enhanced stats card with 2-column grid layout
+            st.markdown(f"""
+            <div class="stats-card">
+                <div class="stats-grid">
+                    <div class="stat-row">
+                        <span class="stat-label">Beta</span>
+                        <span class="stat-value">{result_without['beta']:.4f}</span>
                         </div>
                         <div class="stat-row">
                             <span class="stat-label">R-Squared</span>
@@ -1221,158 +1393,412 @@ def run_beta_analysis():
                         </div>
                         <div class="stat-row">
                             <span class="stat-label">Observations</span>
-                            <span class="stat-value">{result_without['n_obs']}</span>
-                        </div>
+                        <span class="stat-value">{result_without['n_obs']}</span>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
-                
-                # Interactive Plotly chart (no title)
-                fig2_plotly = plot_capm_plotly(result_without, with_alpha=False)
-                st.plotly_chart(fig2_plotly, use_container_width=True)
+            </div>
+            """, unsafe_allow_html=True)
             
-            # Download section at bottom
-            st.markdown("**📥 Download Options**")
-            
-            col_dl1, col_dl2, col_dl3 = st.columns(3)
-            with col_dl1:
-                # Normalized prices CSV
-                stock_norm = (stock_prices / stock_prices.iloc[0]) * 100
-                market_norm = (market_prices / market_prices.iloc[0]) * 100
-                if isinstance(stock_norm, pd.DataFrame):
-                    stock_norm = stock_norm.squeeze()
-                if isinstance(market_norm, pd.DataFrame):
-                    market_norm = market_norm.squeeze()
-                norm_data = pd.DataFrame({
-                    'Date': stock_prices.index,
-                    f'{company_ticker}_Normalized': stock_norm,
-                    f'{market_ticker}_Normalized': market_norm
-                })
-                norm_csv = create_csv_download(norm_data, f"{company_ticker}_normalized_prices.csv")
-                st.download_button("📥 Normalized Prices (CSV)", norm_csv, f"{company_ticker}_normalized_prices.csv", "text/csv", use_container_width=True, key="dl_capm_norm")
-                
-            with col_dl2:
-                # With Alpha downloads
-                st.markdown("**With Alpha**")
-                fig1_mpl = plot_capm(result_with, chart_color, with_alpha=True)
-                buf1 = save_figure(fig1_mpl)
-                st.download_button("📥 Chart (PNG)", buf1, f"{company_ticker}_capm_with_alpha.png", "image/png", use_container_width=True, key="dl_capm_with_png")
-                plt.close(fig1_mpl)
-                
-                reg_data_with = result_with['data'].copy()
-                # For statsmodels with alpha, need to add constant
-                X_pred_with = sm.add_constant(reg_data_with[['market']])
-                reg_data_with['fitted'] = result_with['model'].predict(X_pred_with)
-                reg_csv_with = create_csv_download(reg_data_with, f"{company_ticker}_regression_with_alpha.csv")
-                st.download_button("📥 Data (CSV)", reg_csv_with, f"{company_ticker}_regression_with_alpha.csv", "text/csv", use_container_width=True, key="dl_capm_with_csv")
-                
-            with col_dl3:
-                # Without Alpha downloads
-                st.markdown("**Without Alpha**")
-                fig2_mpl = plot_capm(result_without, chart_color, with_alpha=False)
-                buf2 = save_figure(fig2_mpl)
-                st.download_button("📥 Chart (PNG)", buf2, f"{company_ticker}_capm_without_alpha.png", "image/png", use_container_width=True, key="dl_capm_without_png")
-                plt.close(fig2_mpl)
-                
-                reg_data_without = result_without['data'].copy()
-                # For statsmodels without alpha, predict directly
-                reg_data_without['fitted'] = result_without['model'].predict(reg_data_without[['market']])
-                reg_csv_without = create_csv_download(reg_data_without, f"{company_ticker}_regression_without_alpha.csv")
-                st.download_button("📥 Data (CSV)", reg_csv_without, f"{company_ticker}_regression_without_alpha.csv", "text/csv", use_container_width=True, key="dl_capm_without_csv")
-            
-            # Interpretation
-            st.markdown("**Interpretation**")
-            beta = result_with['beta']
-            if beta > 1:
-                st.info(f"Beta = {beta:.4f} → Stock is **more volatile** than the market")
-            elif beta < 1 and beta > 0:
-                st.info(f"Beta = {beta:.4f} → Stock is **less volatile** than the market")
-            elif beta < 0:
-                st.info(f"Beta = {beta:.4f} → Stock moves **inversely** to the market")
-            else:
-                st.info(f"Beta = {beta:.4f} → No correlation with the market")
+            # Interactive Plotly chart (no title)
+            fig2_plotly = plot_capm_plotly(result_without, with_alpha=False)
+            st.plotly_chart(fig2_plotly, use_container_width=True)
         
-        # Rolling Beta
-        elif beta_method == "Rolling Beta":
-            st.markdown("#### Rolling Beta Analysis")
+        # Download section at bottom
+        st.markdown("**📥 Download Options**")
+        
+        col_dl1, col_dl2, col_dl3 = st.columns(3)
+        with col_dl1:
+            # Normalized prices CSV
+            stock_norm = (stock_prices / stock_prices.iloc[0]) * 100
+            market_norm = (market_prices / market_prices.iloc[0]) * 100
+            if isinstance(stock_norm, pd.DataFrame):
+                stock_norm = stock_norm.squeeze()
+            if isinstance(market_norm, pd.DataFrame):
+                market_norm = market_norm.squeeze()
             
-            rolling_betas = calculate_rolling_beta(stock_excess, market_excess, rolling_period)
+            # Ensure both series have the same index
+            common_index = stock_norm.index.intersection(market_norm.index)
+            stock_norm = stock_norm.loc[common_index]
+            market_norm = market_norm.loc[common_index]
             
-            if rolling_betas is None or len(rolling_betas) < 2:
-                st.error(f"Insufficient data for rolling beta with window size {rolling_period}")
-                st.stop()
-            
-            # Normalized Price Chart (before rolling beta chart)
-            st.markdown("**Normalized Price Performance**")
-            fig_norm = plot_normalized_prices(stock_prices, market_prices, company_ticker, market_ticker)
-            st.plotly_chart(fig_norm, use_container_width=True)
-            
-            # Metrics
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Current Beta", f"{rolling_betas.iloc[-1]:.4f}")
-            with col2:
-                st.metric("Mean Beta", f"{rolling_betas.mean():.4f}")
-            with col3:
-                st.metric("Min Beta", f"{rolling_betas.min():.4f}")
-            with col4:
-                st.metric("Max Beta", f"{rolling_betas.max():.4f}")
-            
-            # Interactive Plotly chart
-            st.markdown("**Historical Beta Over Time**")
-            fig_plotly = plot_rolling_plotly(rolling_betas, rolling_period)
-            st.plotly_chart(fig_plotly, use_container_width=True)
-            
-            # Download section
-            st.markdown("**📥 Download Options**")
-            
-            col_dl1, col_dl2, col_dl3 = st.columns(3)
-            with col_dl1:
-                # Normalized prices CSV
-                stock_norm = (stock_prices / stock_prices.iloc[0]) * 100
-                market_norm = (market_prices / market_prices.iloc[0]) * 100
-                if isinstance(stock_norm, pd.DataFrame):
-                    stock_norm = stock_norm.squeeze()
-                if isinstance(market_norm, pd.DataFrame):
-                    market_norm = market_norm.squeeze()
-                norm_data = pd.DataFrame({
-                    'Date': stock_prices.index,
-                    f'{company_ticker}_Normalized': stock_norm,
-                    f'{market_ticker}_Normalized': market_norm
-                })
-                norm_csv = create_csv_download(norm_data, f"{company_ticker}_normalized_prices.csv")
-                st.download_button("📥 Normalized Prices (CSV)", norm_csv, f"{company_ticker}_normalized_prices.csv", "text/csv", use_container_width=True, key="dl_rolling_norm")
-                
-            with col_dl2:
-                # PNG download (matplotlib)
-                fig_mpl = plot_rolling(rolling_betas, chart_color, rolling_period)
-                buf = save_figure(fig_mpl)
-                st.download_button("📥 Rolling Beta Chart (PNG)", buf, f"{company_ticker}_rolling_beta.png", "image/png", use_container_width=True, key="dl_rolling_png")
-                plt.close(fig_mpl)
-                
-            with col_dl3:
-                # CSV data download
-                rolling_data = pd.DataFrame({
-                    'Date': rolling_betas.index,
-                    'Beta': rolling_betas.values
-                })
-                rolling_csv = create_csv_download(rolling_data, f"{company_ticker}_rolling_beta.csv")
-                st.download_button("📥 Rolling Beta Data (CSV)", rolling_csv, f"{company_ticker}_rolling_beta.csv", "text/csv", use_container_width=True, key="dl_rolling_csv")
-            
-            # Statistics
-            st.markdown("**Statistics**")
-            stats_df = pd.DataFrame({
-                'Metric': ['Mean', 'Median', 'Std Dev', 'Min', 'Max', 'Current'],
-                'Value': [
-                    f"{rolling_betas.mean():.4f}",
-                    f"{rolling_betas.median():.4f}",
-                    f"{rolling_betas.std():.4f}",
-                    f"{rolling_betas.min():.4f}",
-                    f"{rolling_betas.max():.4f}",
-                    f"{rolling_betas.iloc[-1]:.4f}"
-                ]
+            norm_data = pd.DataFrame({
+                'Date': common_index,
+                f'{company_ticker}_Normalized': stock_norm.values,
+                f'{market_ticker}_Normalized': market_norm.values
             })
-            st.dataframe(stats_df, use_container_width=True, hide_index=True)
+            norm_csv = create_csv_download(norm_data, f"{company_ticker}_normalized_prices.csv")
+            st.download_button("📥 Normalized Prices (CSV)", norm_csv, f"{company_ticker}_normalized_prices.csv", "text/csv", use_container_width=True, key=f"dl_capm_norm_{market_ticker}")
+            
+        with col_dl2:
+            # With Alpha downloads
+            st.markdown("**With Alpha**")
+            fig1_mpl = plot_capm(result_with, chart_color, with_alpha=True)
+            buf1 = save_figure(fig1_mpl)
+            st.download_button("📥 Chart (PNG)", buf1, f"{company_ticker}_capm_with_alpha.png", "image/png", use_container_width=True, key=f"dl_capm_with_png_{market_ticker}")
+            plt.close(fig1_mpl)
+            
+            reg_data_with = result_with['data'].copy()
+            # For statsmodels with alpha, need to add constant
+            X_pred_with = sm.add_constant(reg_data_with[['market']])
+            reg_data_with['fitted'] = result_with['model'].predict(X_pred_with)
+            reg_csv_with = create_csv_download(reg_data_with, f"{company_ticker}_regression_with_alpha.csv")
+            st.download_button("📥 Data (CSV)", reg_csv_with, f"{company_ticker}_regression_with_alpha.csv", "text/csv", use_container_width=True, key=f"dl_capm_with_csv_{market_ticker}")
+            
+        with col_dl3:
+            # Without Alpha downloads
+            st.markdown("**Without Alpha**")
+            fig2_mpl = plot_capm(result_without, chart_color, with_alpha=False)
+            buf2 = save_figure(fig2_mpl)
+            st.download_button("📥 Chart (PNG)", buf2, f"{company_ticker}_capm_without_alpha.png", "image/png", use_container_width=True, key=f"dl_capm_without_png_{market_ticker}")
+            plt.close(fig2_mpl)
+            
+            reg_data_without = result_without['data'].copy()
+            # For statsmodels without alpha, predict directly
+            reg_data_without['fitted'] = result_without['model'].predict(reg_data_without[['market']])
+            reg_csv_without = create_csv_download(reg_data_without, f"{company_ticker}_regression_without_alpha.csv")
+            st.download_button("📥 Data (CSV)", reg_csv_without, f"{company_ticker}_regression_without_alpha.csv", "text/csv", use_container_width=True, key=f"dl_capm_without_csv_{market_ticker}")
+        
+        # Interpretation
+        st.markdown("**Interpretation**")
+        beta = result_with['beta']
+        if beta > 1:
+            st.info(f"Beta = {beta:.4f} → Stock is **more volatile** than the market")
+        elif beta < 1 and beta > 0:
+            st.info(f"Beta = {beta:.4f} → Stock is **less volatile** than the market")
+        elif beta < 0:
+            st.info(f"Beta = {beta:.4f} → Stock moves **inversely** to the market")
+        else:
+            st.info(f"Beta = {beta:.4f} → No correlation with the market")
+    
+    # Rolling Beta
+    elif beta_method == "Rolling Beta":
+        st.markdown("#### Rolling Beta Analysis")
+        
+        rolling_betas = calculate_rolling_beta(stock_excess, market_excess, rolling_period)
+        
+        if rolling_betas is None or len(rolling_betas) < 2:
+            st.error(f"Insufficient data for rolling beta with window size {rolling_period}")
+            st.stop()
+        
+        # Normalized Price Chart (before rolling beta chart)
+        st.markdown("**Normalized Price Performance**")
+        fig_norm = plot_normalized_prices(stock_prices, market_prices, company_ticker, market_ticker)
+        st.plotly_chart(fig_norm, use_container_width=True)
+        
+        # Metrics
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Current Beta", f"{rolling_betas.iloc[-1]:.4f}")
+        with col2:
+            st.metric("Mean Beta", f"{rolling_betas.mean():.4f}")
+        with col3:
+            st.metric("Min Beta", f"{rolling_betas.min():.4f}")
+        with col4:
+            st.metric("Max Beta", f"{rolling_betas.max():.4f}")
+        
+        # Interactive Plotly chart
+        st.markdown("**Historical Beta Over Time**")
+        fig_plotly = plot_rolling_plotly(rolling_betas, rolling_period)
+        st.plotly_chart(fig_plotly, use_container_width=True)
+        
+        # Download section
+        st.markdown("**📥 Download Options**")
+        
+        col_dl1, col_dl2, col_dl3 = st.columns(3)
+        with col_dl1:
+            # Normalized prices CSV - ensure alignment
+            stock_norm = (stock_prices / stock_prices.iloc[0]) * 100
+            market_norm = (market_prices / market_prices.iloc[0]) * 100
+            if isinstance(stock_norm, pd.DataFrame):
+                stock_norm = stock_norm.squeeze()
+            if isinstance(market_norm, pd.DataFrame):
+                market_norm = market_norm.squeeze()
+            
+            # Align series to ensure same length
+            stock_norm, market_norm = stock_norm.align(market_norm, join='inner')
+            
+            # Create DataFrame with aligned data
+            norm_data = pd.DataFrame({
+                'Date': stock_norm.index,
+                f'{company_ticker}_Normalized': stock_norm.values,
+                f'{market_ticker}_Normalized': market_norm.values
+            })
+            
+            norm_csv = create_csv_download(norm_data, f"{company_ticker}_normalized_prices.csv")
+            st.download_button("📥 Normalized Prices (CSV)", norm_csv, f"{company_ticker}_normalized_prices.csv", "text/csv", use_container_width=True, key=f"dl_rolling_norm_{market_ticker}")
+            
+        with col_dl2:
+            # PNG download (matplotlib)
+            fig_mpl = plot_rolling(rolling_betas, chart_color, rolling_period)
+            buf = save_figure(fig_mpl)
+            st.download_button("📥 Rolling Beta Chart (PNG)", buf, f"{company_ticker}_rolling_beta.png", "image/png", use_container_width=True, key=f"dl_rolling_png_{market_ticker}")
+            plt.close(fig_mpl)
+            
+        with col_dl3:
+            # CSV data download
+            rolling_data = pd.DataFrame({
+                'Date': rolling_betas.index,
+                'Beta': rolling_betas.values
+            })
+            rolling_csv = create_csv_download(rolling_data, f"{company_ticker}_rolling_beta.csv")
+            st.download_button("📥 Rolling Beta Data (CSV)", rolling_csv, f"{company_ticker}_rolling_beta.csv", "text/csv", use_container_width=True, key=f"dl_rolling_csv_{market_ticker}")
+        
+        # Statistics
+        st.markdown("**Statistics**")
+        stats_df = pd.DataFrame({
+            'Metric': ['Mean', 'Median', 'Std Dev', 'Min', 'Max', 'Current'],
+            'Value': [
+                f"{rolling_betas.mean():.4f}",
+                f"{rolling_betas.median():.4f}",
+                f"{rolling_betas.std():.4f}",
+                f"{rolling_betas.min():.4f}",
+                f"{rolling_betas.max():.4f}",
+                f"{rolling_betas.iloc[-1]:.4f}"
+            ]
+        })
+        st.dataframe(stats_df, use_container_width=True, hide_index=True)
+        
+        # COE Backtesting Section
+        st.markdown("---")
+        st.markdown("#### 💰 Cost of Equity (COE) Backtesting")
+        st.caption("Validate COE predictions against actual forward returns using historical Risk-Free rates")
+        
+        if st.button("🔬 Run COE Backtest", key="coe_backtest"):
+            with st.spinner("Loading historical risk-free rates and calculating COE..."):
+                    try:
+                        # COE backtesting is always done annually for stability
+                        # Load annual bond yield data (use monthly as closest to annual)
+                        sheet_name = 'India 10-Y Bond Yield Monthly'
+                        
+                        # Load historical India 10Y G-Sec yields from Excel file
+                        excel_path = os.path.join(os.path.dirname(__file__), 'India 10-Year Bond Yield Historical Data.xlsx')
+                        bond_data = pd.read_excel(excel_path, sheet_name=sheet_name)
+                        
+                        # Convert Date column to datetime and set as index
+                        bond_data['Date'] = pd.to_datetime(bond_data['Date'])
+                        bond_data.set_index('Date', inplace=True)
+                        bond_data.sort_index(inplace=True)
+                        
+                        # Use Price column (yield) and convert to decimal
+                        bond_yields = bond_data['Price'] / 100
+                        
+                        # Get raw returns from session state and resample to annual
+                        stock_returns_raw = st.session_state['stock_returns']
+                        market_returns_raw = st.session_state['market_returns']
+                        
+                        # Resample to annual frequency (end of year)
+                        stock_prices_raw = st.session_state['stock_prices']
+                        market_prices_raw = st.session_state['market_prices']
+                        
+                        # Ensure prices are Series (not DataFrame)
+                        if isinstance(stock_prices_raw, pd.DataFrame):
+                            stock_prices_raw = stock_prices_raw.squeeze()
+                        if isinstance(market_prices_raw, pd.DataFrame):
+                            market_prices_raw = market_prices_raw.squeeze()
+                        
+                        # Calculate annual returns from prices
+                        stock_annual = stock_prices_raw.resample('YE').last()
+                        market_annual = market_prices_raw.resample('YE').last()
+                        
+                        stock_returns_annual = stock_annual.pct_change().dropna()
+                        market_returns_annual = market_annual.pct_change().dropna()
+                        
+                        # Resample rolling beta to annual (take last value of each year)
+                        rolling_betas_annual = rolling_betas.resample('YE').last().dropna()
+                        
+                        # Calculate annual ERP using market returns and annual historical Rf
+                        market_excess_annual = []
+                        
+                        for date in market_returns_annual.index:
+                            # Get historical annual Rf for this date
+                            if date in bond_yields.index:
+                                annual_rf = bond_yields.loc[date]
+                            else:
+                                available_dates = bond_yields.index[bond_yields.index <= date]
+                                if len(available_dates) > 0:
+                                    annual_rf = bond_yields.loc[available_dates[-1]]
+                                else:
+                                    annual_rf = 0.045  # Fallback to 4.5%
+                            
+                            # Calculate annual excess return (no conversion needed - both are annual)
+                            market_excess_annual.append(market_returns_annual.loc[date] - annual_rf)
+                        
+                        # ERP = average of annual market excess returns
+                        erp_annual = np.mean(market_excess_annual)
+                        
+                        # ERP = average of annual market excess returns
+                        erp_annual = np.mean(market_excess_annual)
+                        
+                        # Calculate annual COE for each year using annual rolling beta and historical annual Rf
+                        coe_values = []
+                        actual_returns = []
+                        dates = []
+                        rf_used = []
+                        
+                        for i in range(len(rolling_betas_annual) - 1):  # -1 because we need next year's return
+                            date = rolling_betas_annual.index[i]
+                            next_date = rolling_betas_annual.index[i + 1]
+                            
+                            # Get closest historical annual Rf for this date
+                            if date in bond_yields.index:
+                                annual_rf = bond_yields.loc[date]
+                            else:
+                                # Forward fill to nearest available date
+                                available_dates = bond_yields.index[bond_yields.index <= date]
+                                if len(available_dates) > 0:
+                                    annual_rf = bond_yields.loc[available_dates[-1]]
+                                else:
+                                    continue  # Skip if no historical data available
+                            
+                            # Calculate annual COE = annual Rf + (Beta × annual ERP)
+                            coe = annual_rf + (rolling_betas_annual.iloc[i] * erp_annual)
+                            
+                            # Get actual annual return for next year using date-based lookup
+                            if next_date in stock_returns_annual.index:
+                                actual_return = stock_returns_annual.loc[next_date]
+                            else:
+                                continue  # Skip if next return not available
+                            
+                            coe_values.append(coe)
+                            actual_returns.append(actual_return)
+                            dates.append(date)
+                            rf_used.append(annual_rf)
+                        
+                        # Convert to arrays for calculations
+                        coe_array = np.array(coe_values)
+                        actual_array = np.array(actual_returns)
+                        
+                        # Calculate error metrics
+                        mae = np.mean(np.abs(coe_array - actual_array))
+                        rmse = np.sqrt(np.mean((coe_array - actual_array) ** 2))
+                        
+                        # MAPE (Mean Absolute Percentage Error) - avoid division by zero
+                        mape = np.mean(np.abs((actual_array - coe_array) / np.where(actual_array != 0, actual_array, 1))) * 100
+                        
+                        # SMAPE (Symmetric Mean Absolute Percentage Error)
+                        smape = np.mean(2 * np.abs(coe_array - actual_array) / (np.abs(coe_array) + np.abs(actual_array) + 1e-10)) * 100
+                        
+                        # Hit rate (% correct direction)
+                        correct_direction = np.sum((coe_array > 0) == (actual_array > 0))
+                        hit_rate = (correct_direction / len(coe_array)) * 100
+                        
+                        # Display metrics in one row
+                        col1, col2, col3, col4, col5 = st.columns(5)
+                        with col1:
+                            st.metric("MAE", f"{mae:.6f}", help="Mean Absolute Error")
+                        with col2:
+                            st.metric("RMSE", f"{rmse:.6f}", help="Root Mean Squared Error")
+                        with col3:
+                            st.metric("MAPE", f"{mape:.2f}%", help="Mean Absolute Percentage Error")
+                        with col4:
+                            st.metric("SMAPE", f"{smape:.2f}%", help="Symmetric Mean Absolute Percentage Error")
+                        with col5:
+                            st.metric("Hit Rate", f"{hit_rate:.1f}%", help="% correct direction predictions")
+                        
+                        # Create comparison chart with dual y-axes for better visualization
+                        from plotly.subplots import make_subplots
+                        
+                        fig_coe = make_subplots(specs=[[{"secondary_y": True}]])
+                        
+                        # Add COE predictions on secondary y-axis (left)
+                        fig_coe.add_trace(
+                            go.Scatter(
+                                x=dates,
+                                y=coe_array * 100,
+                                name='Predicted COE',
+                                line=dict(color='#c792ea', width=2.5),
+                                mode='lines'
+                            ),
+                            secondary_y=False
+                        )
+                        
+                        # Add actual returns on primary y-axis (right)
+                        fig_coe.add_trace(
+                            go.Scatter(
+                                x=dates,
+                                y=actual_array * 100,
+                                name='Actual Forward Returns',
+                                line=dict(color='#89ddff', width=2),
+                                mode='lines',
+                                opacity=0.7
+                            ),
+                            secondary_y=True
+                        )
+                        
+                        # Add zero lines
+                        fig_coe.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.3, secondary_y=False)
+                        fig_coe.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.3, secondary_y=True)
+                        
+                        # Update layout
+                        fig_coe.update_xaxes(title_text="Date")
+                        fig_coe.update_yaxes(title_text="Predicted Annual COE (%)", secondary_y=False, title_font=dict(color='#c792ea'))
+                        fig_coe.update_yaxes(title_text="Actual Annual Returns (%)", secondary_y=True, title_font=dict(color='#89ddff'))
+                        
+                        fig_coe.update_layout(
+                            title="Annual Cost of Equity vs Actual Annual Returns (Dual Axis)",
+                            hovermode='x unified',
+                            template="plotly_dark",
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                            font=dict(color='#d4d4d4'),
+                            legend=dict(
+                                yanchor="top",
+                                y=0.99,
+                                xanchor="left",
+                                x=0.01
+                            )
+                        )
+                        
+                        st.plotly_chart(fig_coe, use_container_width=True)
+                        
+                        # Error distribution
+                        st.markdown("**Error Distribution**")
+                        errors = coe_array - actual_array
+                        
+                        fig_error = go.Figure()
+                        fig_error.add_trace(go.Histogram(
+                            x=errors * 100,
+                            nbinsx=50,
+                            marker_color='#c792ea',
+                            name='Prediction Errors'
+                        ))
+                        
+                        fig_error.update_layout(
+                            title="Distribution of Prediction Errors",
+                            xaxis_title="Error (%)",
+                            yaxis_title="Frequency",
+                            template="plotly_dark",
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                            font=dict(color='#d4d4d4'),
+                            showlegend=False
+                        )
+                        
+                        st.plotly_chart(fig_error, use_container_width=True)
+                        
+                        # Download COE data
+                        coe_df = pd.DataFrame({
+                            'Date': dates,
+                            'Rolling_Beta': rolling_betas.iloc[:len(dates)].values,
+                            'Historical_Rf_Annual': rf_used,
+                            'Predicted_COE': coe_array,
+                            'Actual_Forward_Return': actual_array,
+                            'Error': errors,
+                            'Abs_Error': np.abs(errors)
+                        })
+                        
+                        coe_csv = coe_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="📥 Download COE Backtest Data (CSV)",
+                            data=coe_csv,
+                            file_name=f"{company_ticker}_coe_backtest.csv",
+                            mime="text/csv",
+                            key=f"dl_coe_backtest_{market_ticker}"
+                        )
+                        
+                    except Exception as e:
+                        st.error(f"Error loading bond yield data: {str(e)}")
+                        st.info("💡 Ensure 'India 10-Year Bond Yield Historical Data.xlsx' is in the same folder as the dashboard.")
     
     else:
         st.info("👈 Configure parameters in the sidebar and click 'Calculate Beta' to begin")
